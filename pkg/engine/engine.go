@@ -54,6 +54,7 @@ import (
 
 	"github.com/xiaobaowan1988/oktrading/pkg/disruptor"
 	"github.com/xiaobaowan1988/oktrading/pkg/orderbook"
+	"github.com/xiaobaowan1988/oktrading/pkg/pool"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
 
@@ -168,6 +169,9 @@ func (e *Engine) process(cmd *types.Command) {
 	case types.CmdCancelOrder:
 		e.handleCancelOrder(cmd)
 	}
+	// Command is no longer needed after handlers complete; return to pool.
+	cmd.Order = nil
+	pool.PutCommand(cmd)
 }
 
 func (e *Engine) handleNewOrder(cmd *types.Command) {
@@ -183,34 +187,25 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		// Reject before touching the book if it would cross immediately.
 		if e.wouldCross(order) {
 			order.Status = types.StatusRejected
-			e.emit(&types.Event{
-				Type:       types.EvtOrderRejected,
-				SequenceNo: e.localSeq,
-				Symbol:     e.symbol,
-				Order:      order,
-				Reason:     "post-only order would immediately match",
-			})
+			evt := pool.GetEvent()
+			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
+			evt.Reason = "post-only order would immediately match"
+			e.emit(evt)
 			return
 		}
 		e.book.AddOrder(order)
-		e.emit(&types.Event{
-			Type:       types.EvtOrderAccepted,
-			SequenceNo: e.localSeq,
-			Symbol:     e.symbol,
-			Order:      order,
-		})
+		evt := pool.GetEvent()
+		evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderAccepted, e.localSeq, e.symbol, order
+		e.emit(evt)
 
 	case types.FOK:
 		// Pre-check: if full fill is impossible, reject without touching the book.
 		if !e.canFillCompletely(order) {
 			order.Status = types.StatusRejected
-			e.emit(&types.Event{
-				Type:       types.EvtOrderRejected,
-				SequenceNo: e.localSeq,
-				Symbol:     e.symbol,
-				Order:      order,
-				Reason:     "insufficient liquidity for FOK",
-			})
+			evt := pool.GetEvent()
+			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
+			evt.Reason = "insufficient liquidity for FOK"
+			e.emit(evt)
 			return
 		}
 		// Full fill is guaranteed – proceed.
@@ -224,12 +219,9 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Rest the unfilled portion as a maker order.
 			e.book.AddOrder(order)
-			e.emit(&types.Event{
-				Type:       types.EvtOrderAccepted,
-				SequenceNo: e.localSeq,
-				Symbol:     e.symbol,
-				Order:      order,
-			})
+			evt := pool.GetEvent()
+			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderAccepted, e.localSeq, e.symbol, order
+			e.emit(evt)
 		} else {
 			e.emitOrderUpdate(order)
 		}
@@ -240,12 +232,9 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Cancel whatever could not be immediately filled.
 			order.Status = types.StatusCancelled
-			e.emit(&types.Event{
-				Type:       types.EvtOrderCancelled,
-				SequenceNo: e.localSeq,
-				Symbol:     e.symbol,
-				Order:      order,
-			})
+			evt := pool.GetEvent()
+			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
+			e.emit(evt)
 		} else {
 			e.emitOrderUpdate(order)
 		}
@@ -256,45 +245,34 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Market order exhausted all available liquidity; cancel residual.
 			order.Status = types.StatusCancelled
-			e.emit(&types.Event{
-				Type:       types.EvtOrderCancelled,
-				SequenceNo: e.localSeq,
-				Symbol:     e.symbol,
-				Order:      order,
-			})
+			evt := pool.GetEvent()
+			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
+			e.emit(evt)
 		} else {
 			e.emitOrderUpdate(order)
 		}
 
 	default:
 		order.Status = types.StatusRejected
-		e.emit(&types.Event{
-			Type:       types.EvtOrderRejected,
-			SequenceNo: e.localSeq,
-			Symbol:     e.symbol,
-			Order:      order,
-			Reason:     "unknown order type",
-		})
+		evt := pool.GetEvent()
+		evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
+		evt.Reason = "unknown order type"
+		e.emit(evt)
 	}
 }
 
 func (e *Engine) handleCancelOrder(cmd *types.Command) {
 	order, ok := e.book.CancelOrder(cmd.CancelID)
 	if !ok {
-		e.emit(&types.Event{
-			Type:       types.EvtOrderRejected,
-			SequenceNo: e.localSeq,
-			Symbol:     e.symbol,
-			Reason:     "cancel rejected: order not found",
-		})
+		evt := pool.GetEvent()
+		evt.Type, evt.SequenceNo, evt.Symbol = types.EvtOrderRejected, e.localSeq, e.symbol
+		evt.Reason = "cancel rejected: order not found"
+		e.emit(evt)
 		return
 	}
-	e.emit(&types.Event{
-		Type:       types.EvtOrderCancelled,
-		SequenceNo: e.localSeq,
-		Symbol:     e.symbol,
-		Order:      order,
-	})
+	evt := pool.GetEvent()
+	evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
+	e.emit(evt)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -350,22 +328,16 @@ func (e *Engine) emitTrades(trades []*types.Trade) {
 		e.tradeSeq++
 		tr.TradeID = e.tradeSeq
 		tr.SequenceNo = e.localSeq
-		e.emit(&types.Event{
-			Type:       types.EvtTrade,
-			SequenceNo: e.localSeq,
-			Symbol:     e.symbol,
-			Trade:      tr,
-		})
+		evt := pool.GetEvent()
+		evt.Type, evt.SequenceNo, evt.Symbol, evt.Trade = types.EvtTrade, e.localSeq, e.symbol, tr
+		e.emit(evt)
 	}
 }
 
 func (e *Engine) emitOrderUpdate(order *types.Order) {
-	e.emit(&types.Event{
-		Type:       types.EvtOrderFilled,
-		SequenceNo: e.localSeq,
-		Symbol:     e.symbol,
-		Order:      order,
-	})
+	evt := pool.GetEvent()
+	evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderFilled, e.localSeq, e.symbol, order
+	e.emit(evt)
 }
 
 func (e *Engine) emit(evt *types.Event) {

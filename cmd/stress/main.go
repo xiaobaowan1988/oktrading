@@ -26,12 +26,14 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/xiaobaowan1988/oktrading/pkg/engine"
+	"github.com/xiaobaowan1988/oktrading/pkg/pool"
 	"github.com/xiaobaowan1988/oktrading/pkg/shard"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
@@ -45,6 +47,8 @@ var (
 	flagTakers   = flag.Int("takers", 4, "taker goroutines per symbol")
 	flagMakers   = flag.Int("makers", 2, "maker goroutines per symbol")
 	flagReport   = flag.Duration("report", 3*time.Second, "live stats interval (0 = off)")
+	flagGOGC     = flag.Int("gogc", 100, "GOGC percentage (-1=disable, 400=recommended with -memlimit)")
+	flagMemLimit = flag.Int64("memlimit", 0, "soft memory limit in MiB (0 = no limit; use -gogc=-1 with a limit)")
 )
 
 // ── Global counters ───────────────────────────────────────────────────────────
@@ -63,6 +67,12 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// Apply GC tuning before any heap activity.
+	debug.SetGCPercent(*flagGOGC)
+	if *flagMemLimit > 0 {
+		debug.SetMemoryLimit(*flagMemLimit << 20)
+	}
 
 	numSymbols := *flagSymbols
 	depth := *flagDepth
@@ -237,41 +247,41 @@ func runMaker(eng *engine.Engine, sym string, depth, makerID int, deadline time.
 	_ = rng
 
 	for time.Now().Before(deadline) {
-		// Post a sell slightly above mid.
 		level := int64(rng.Intn(depth) + 1)
-		id := orderID.Add(1)
-		// Timestamp=0 → engine stamps it at dequeue; latency = engine-pickup → event-receipt.
-		for !eng.TrySubmit(&types.Command{
-			Type: types.CmdNewOrder,
-			Order: &types.Order{
-				OrderID:   id,
-				Symbol:    sym,
-				Side:      types.Sell,
-				Type:      types.Limit,
-				Price:     mid + level*tick,
-				Quantity:  lotSize,
-				Remaining: lotSize,
-			},
-		}) {
+
+		// Post a sell slightly above mid.
+		ask := pool.GetOrder()
+		ask.OrderID = orderID.Add(1)
+		ask.Symbol = sym
+		ask.Side = types.Sell
+		ask.Type = types.Limit
+		ask.Price = mid + level*tick
+		ask.Quantity = lotSize
+		ask.Remaining = lotSize
+
+		askCmd := pool.GetCommand()
+		askCmd.Type = types.CmdNewOrder
+		askCmd.Order = ask
+		for !eng.TrySubmit(askCmd) {
 			atomic.AddInt64(&totalBPressure, 1)
 			runtime.Gosched()
 		}
 		atomic.AddInt64(&totalSubmitted, 1)
 
 		// Post a bid slightly below mid.
-		id = orderID.Add(1)
-		for !eng.TrySubmit(&types.Command{
-			Type: types.CmdNewOrder,
-			Order: &types.Order{
-				OrderID:   id,
-				Symbol:    sym,
-				Side:      types.Buy,
-				Type:      types.Limit,
-				Price:     mid - level*tick,
-				Quantity:  lotSize,
-				Remaining: lotSize,
-			},
-		}) {
+		bid := pool.GetOrder()
+		bid.OrderID = orderID.Add(1)
+		bid.Symbol = sym
+		bid.Side = types.Buy
+		bid.Type = types.Limit
+		bid.Price = mid - level*tick
+		bid.Quantity = lotSize
+		bid.Remaining = lotSize
+
+		bidCmd := pool.GetCommand()
+		bidCmd.Type = types.CmdNewOrder
+		bidCmd.Order = bid
+		for !eng.TrySubmit(bidCmd) {
 			atomic.AddInt64(&totalBPressure, 1)
 			runtime.Gosched()
 		}
@@ -289,50 +299,35 @@ func runTaker(eng *engine.Engine, sym string, depth, takerID int, deadline time.
 	rng := rand.New(rand.NewSource(int64(takerID) * 67890))
 
 	for time.Now().Before(deadline) {
-		id := orderID.Add(1)
+		order := pool.GetOrder()
+		order.OrderID = orderID.Add(1)
+		order.Symbol = sym
+		order.Quantity = lotSize
+		order.Remaining = lotSize
 
-		// Timestamp=0 → engine stamps it at dequeue; latency = engine-pickup → event-receipt.
-		var order *types.Order
-		roll := rng.Intn(3)
-		switch roll {
+		switch rng.Intn(3) {
 		case 0: // market buy
-			order = &types.Order{
-				OrderID:   id,
-				Symbol:    sym,
-				Side:      types.Buy,
-				Type:      types.Market,
-				Quantity:  lotSize,
-				Remaining: lotSize,
-			}
+			order.Side = types.Buy
+			order.Type = types.Market
 		case 1: // market sell
-			order = &types.Order{
-				OrderID:   id,
-				Symbol:    sym,
-				Side:      types.Sell,
-				Type:      types.Market,
-				Quantity:  lotSize,
-				Remaining: lotSize,
-			}
+			order.Side = types.Sell
+			order.Type = types.Market
 		case 2: // IOC limit crossing the spread
 			aggression := int64(rng.Intn(depth/2)+1) * tick
-			side := types.Buy
-			price := mid + aggression
 			if rng.Intn(2) == 0 {
-				side = types.Sell
-				price = mid - aggression
+				order.Side = types.Buy
+				order.Price = mid + aggression
+			} else {
+				order.Side = types.Sell
+				order.Price = mid - aggression
 			}
-			order = &types.Order{
-				OrderID:   id,
-				Symbol:    sym,
-				Side:      side,
-				Type:      types.IOC,
-				Price:     price,
-				Quantity:  lotSize,
-				Remaining: lotSize,
-			}
+			order.Type = types.IOC
 		}
 
-		for !eng.TrySubmit(&types.Command{Type: types.CmdNewOrder, Order: order}) {
+		cmd := pool.GetCommand()
+		cmd.Type = types.CmdNewOrder
+		cmd.Order = order
+		for !eng.TrySubmit(cmd) {
 			atomic.AddInt64(&totalBPressure, 1)
 			runtime.Gosched()
 		}
@@ -365,24 +360,41 @@ func runConsumer(eng *engine.Engine, hist *LatencyHistogram, deadline time.Time)
 		switch evt.Type {
 		case types.EvtTrade:
 			atomic.AddInt64(&totalTrades, 1)
-			if evt.Trade != nil && evt.Trade.TakerOrder != nil {
-				ts := evt.Trade.TakerOrder.Timestamp
-				if ts > 0 {
-					hist.Record(now - ts)
+			if evt.Trade != nil {
+				if evt.Trade.TakerOrder != nil && evt.Trade.TakerOrder.Timestamp > 0 {
+					hist.Record(now - evt.Trade.TakerOrder.Timestamp)
 				}
+				// Return fully-consumed maker order to pool.
+				if evt.Trade.MakerOrder != nil && evt.Trade.MakerOrder.Status == types.StatusFilled {
+					pool.PutOrder(evt.Trade.MakerOrder)
+				}
+				pool.PutTrade(evt.Trade)
 			}
 		case types.EvtOrderFilled:
+			// Taker order fully filled; all EvtTrade events for this order have
+			// already been processed (ring buffer is FIFO) so the Order is safe to return.
 			atomic.AddInt64(&totalFills, 1)
+			if evt.Order != nil {
+				pool.PutOrder(evt.Order)
+			}
 		case types.EvtOrderCancelled:
 			atomic.AddInt64(&totalCancels, 1)
+			if evt.Order != nil {
+				pool.PutOrder(evt.Order)
+			}
 		case types.EvtOrderRejected:
 			atomic.AddInt64(&totalRejects, 1)
+			if evt.Order != nil {
+				pool.PutOrder(evt.Order)
+			}
 		case types.EvtOrderAccepted:
-			// resting order confirmed; latency from maker's perspective
+			// Resting maker order — DO NOT return Order (still lives in the book).
 			if evt.Order != nil && evt.Order.Timestamp > 0 {
 				hist.Record(now - evt.Order.Timestamp)
 			}
 		}
+		// Event wrapper itself is always safe to return after the switch above.
+		pool.PutEvent(evt)
 	}
 }
 

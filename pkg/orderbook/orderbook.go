@@ -13,6 +13,7 @@ import (
 	"container/list"
 	"sort"
 
+	"github.com/xiaobaowan1988/oktrading/pkg/pool"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
 
@@ -161,14 +162,14 @@ func (ob *OrderBook) fillLevel(taker *types.Order, node *priceNode) []*types.Tra
 
 		fillQty := min(taker.Remaining, maker.Remaining)
 
-		trades = append(trades, &types.Trade{
-			Symbol:     ob.symbol,
-			MakerOrder: maker,
-			TakerOrder: taker,
-			Price:      node.price, // execution at maker's resting price
-			Quantity:   fillQty,
-			Timestamp:  taker.Timestamp,
-		})
+		tr := pool.GetTrade()
+		tr.Symbol = ob.symbol
+		tr.MakerOrder = maker
+		tr.TakerOrder = taker
+		tr.Price = node.price // execution at maker's resting price
+		tr.Quantity = fillQty
+		tr.Timestamp = taker.Timestamp
+		trades = append(trades, tr)
 
 		taker.Remaining -= fillQty
 		maker.Remaining -= fillQty
