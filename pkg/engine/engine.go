@@ -2,13 +2,14 @@
 //
 // # Architecture
 //
-//	Gateway goroutine
-//	     │  (TrySubmit)
+//	Gateway / maker / taker goroutines  (multiple concurrent producers)
+//	     │  (TrySubmit / Submit)
 //	     ▼
 //	┌─────────────────────────────────────────────────┐
-//	│  inbound  RingBuffer[Command]  (SPSC, lock-free) │
+//	│  inbound  chan *Command  (buffered Go channel)   │
+//	│           MPSC-safe: multiple producers allowed  │
 //	└───────────────────┬─────────────────────────────┘
-//	                    │ Pop
+//	                    │  receive
 //	                    ▼
 //	         ┌──────────────────────┐
 //	         │  Engine goroutine    │  ← runtime.LockOSThread()
@@ -18,7 +19,7 @@
 //	         │  │  (in-memory)   │  │
 //	         │  └────────────────┘  │
 //	         └──────────┬───────────┘
-//	                    │ Push
+//	                    │  Push (single producer)
 //	                    ▼
 //	┌─────────────────────────────────────────────────┐
 //	│  outbound RingBuffer[Event]    (SPSC, lock-free) │
@@ -27,19 +28,24 @@
 //	     ▼
 //	Result handler / persistence / market-data fan-out
 //
+// # Inbound: channel vs ring buffer
+//
+// The inbound path uses a buffered Go channel rather than the Disruptor ring
+// buffer.  The ring buffer is a pure SPSC structure; using it from multiple
+// producer goroutines causes a data race where two goroutines read the same
+// head value, write to the same slot, then both increment head — leaving a
+// slot that was never written and will produce a nil pointer on pop.
+//
+// A Go channel is internally MPSC-safe and fast enough for the inbound path.
+// The single-producer outbound ring buffer (engine → result handler) remains
+// as-is and delivers the low-latency lock-free guarantee where it matters.
+//
 // # Determinism
 //
-// Every command that enters the inbound ring buffer is stamped with a
-// monotonically increasing SequenceNo before being processed.  Given the same
-// sequence of commands a standby replica can reproduce the exact same order
+// Every command received from the inbound channel is stamped with a
+// monotonically increasing SequenceNo before processing.  Given the same
+// sequence of commands a standby replica reproduces the exact same order
 // book state — enabling hot standby failover with minimal recovery time.
-//
-// # No locks in the hot path
-//
-// The matching goroutine never acquires a mutex.  Communication with the
-// outside world happens exclusively through the two lock-free ring buffers.
-// Database writes and market-data publication are handled downstream,
-// asynchronously, so they cannot slow down the matching loop.
 package engine
 
 import (
@@ -64,16 +70,18 @@ type Engine struct {
 	localSeq uint64 // intra-symbol sequence; monotone, no gaps
 	tradeSeq uint64 // trade ID counter
 
-	inbound  *disruptor.RingBuffer[types.Command]
+	// inbound is a buffered channel — safe for multiple concurrent producers.
+	inbound chan *types.Command
+	// outbound is a SPSC ring buffer — written only by the engine goroutine.
 	outbound *disruptor.RingBuffer[types.Event]
 
 	quit chan struct{}
 	done chan struct{}
 }
 
-// New creates an Engine for symbol.  inboundCap and outboundCap set the ring
-// buffer capacities (rounded up to the next power of two).  Pass 0 to use the
-// defaults.
+// New creates an Engine for symbol.  inboundCap sets the channel buffer size;
+// outboundCap sets the SPSC ring buffer capacity (rounded up to power of two).
+// Pass 0 to use the defaults.
 func New(symbol string, inboundCap, outboundCap int) *Engine {
 	if inboundCap <= 0 {
 		inboundCap = defaultInboundSize
@@ -84,7 +92,7 @@ func New(symbol string, inboundCap, outboundCap int) *Engine {
 	return &Engine{
 		symbol:   symbol,
 		book:     orderbook.New(symbol),
-		inbound:  disruptor.New[types.Command](inboundCap),
+		inbound:  make(chan *types.Command, inboundCap),
 		outbound: disruptor.New[types.Event](outboundCap),
 		quit:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -105,22 +113,24 @@ func (e *Engine) Stop() {
 	<-e.done
 }
 
-// TrySubmit dispatches a command to the engine without blocking.
-// Returns false if the inbound ring buffer is full (back-pressure).
-// The caller should assign Order.Timestamp before calling; if it is 0 the
-// engine will set it to now.
+// TrySubmit dispatches a command without blocking.
+// Returns false if the inbound channel is at capacity (back-pressure signal).
 func (e *Engine) TrySubmit(cmd *types.Command) bool {
-	return e.inbound.TryPush(cmd)
+	select {
+	case e.inbound <- cmd:
+		return true
+	default:
+		return false
+	}
 }
 
-// Submit dispatches a command, spinning until space is available.
+// Submit dispatches a command, blocking until the inbound channel has space.
 func (e *Engine) Submit(cmd *types.Command) {
-	e.inbound.Push(cmd)
+	e.inbound <- cmd
 }
 
 // TryPollEvent reads one result event from the outbound ring buffer.
-// Returns (nil, false) when empty.  Callers should drain this in a tight loop
-// or a dedicated consumer goroutine.
+// Returns (nil, false) when empty.
 func (e *Engine) TryPollEvent() (*types.Event, bool) {
 	return e.outbound.TryPop()
 }
@@ -137,20 +147,12 @@ func (e *Engine) run() {
 	}()
 
 	for {
-		// Non-blocking quit check (avoids channel overhead in the hot path).
 		select {
+		case cmd := <-e.inbound:
+			e.process(cmd)
 		case <-e.quit:
 			return
-		default:
 		}
-
-		cmd, ok := e.inbound.TryPop()
-		if !ok {
-			runtime.Gosched() // yield rather than spinning on an empty buffer
-			continue
-		}
-
-		e.process(cmd)
 	}
 }
 
