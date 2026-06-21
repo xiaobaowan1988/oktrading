@@ -1,20 +1,23 @@
 package engine_test
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	"github.com/xiaobaowan1988/oktrading/pkg/engine"
+	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
 
 // pollEvents drains all events from the engine up to a short deadline.
-func pollEvents(e *engine.Engine, want int, timeout time.Duration) []*types.Event {
-	var evts []*types.Event
+func pollEvents(e *engine.Engine, want int, timeout time.Duration) []offheap.RawEvent {
+	var evts []offheap.RawEvent
 	deadline := time.Now().Add(timeout)
+	var dst offheap.RawEvent
 	for time.Now().Before(deadline) {
-		if evt, ok := e.TryPollEvent(); ok {
-			evts = append(evts, evt)
+		if e.TryPollEvent(&dst) {
+			evts = append(evts, dst)
 			if len(evts) >= want {
 				break
 			}
@@ -75,8 +78,8 @@ func TestLimitOrderAcceptedThenFilled(t *testing.T) {
 	if len(evts) < 1 {
 		t.Fatal("timed out waiting for accepted event")
 	}
-	if evts[0].Type != types.EvtOrderAccepted {
-		t.Fatalf("want EvtOrderAccepted, got %v", evts[0].Type)
+	if types.EventType(evts[0].EvtType) != types.EvtOrderAccepted {
+		t.Fatalf("want EvtOrderAccepted, got %v", evts[0].EvtType)
 	}
 
 	// Cross with a matching buy; expect EvtTrade + EvtOrderFilled for the buy.
@@ -89,14 +92,14 @@ func TestLimitOrderAcceptedThenFilled(t *testing.T) {
 		t.Fatalf("want ≥2 events after fill, got %d", len(evts))
 	}
 
-	types_ := make(map[types.EventType]bool)
+	typesMap := make(map[types.EventType]bool)
 	for _, ev := range evts {
-		types_[ev.Type] = true
+		typesMap[types.EventType(ev.EvtType)] = true
 	}
-	if !types_[types.EvtTrade] {
+	if !typesMap[types.EvtTrade] {
 		t.Error("expected EvtTrade")
 	}
-	if !types_[types.EvtOrderFilled] {
+	if !typesMap[types.EvtOrderFilled] {
 		t.Error("expected EvtOrderFilled")
 	}
 }
@@ -121,7 +124,7 @@ func TestMarketOrderFills(t *testing.T) {
 
 	var trades int
 	for _, ev := range evts {
-		if ev.Type == types.EvtTrade {
+		if types.EventType(ev.EvtType) == types.EvtTrade {
 			trades++
 		}
 	}
@@ -147,10 +150,10 @@ func TestIOCCancelsResidue(t *testing.T) {
 
 	var sawTrade, sawCancel bool
 	for _, ev := range evts {
-		if ev.Type == types.EvtTrade {
+		if types.EventType(ev.EvtType) == types.EvtTrade {
 			sawTrade = true
 		}
-		if ev.Type == types.EvtOrderCancelled {
+		if types.EventType(ev.EvtType) == types.EvtOrderCancelled {
 			sawCancel = true
 		}
 	}
@@ -179,15 +182,15 @@ func TestFOKRejectInsufficientLiquidity(t *testing.T) {
 	if len(evts) == 0 {
 		t.Fatal("expected a rejection event")
 	}
-	if evts[0].Type != types.EvtOrderRejected {
-		t.Errorf("want EvtOrderRejected, got %v", evts[0].Type)
+	if types.EventType(evts[0].EvtType) != types.EvtOrderRejected {
+		t.Errorf("want EvtOrderRejected, got %v", evts[0].EvtType)
 	}
 	// The resting sell must not have been consumed.
 	submit(e, &types.Command{Type: types.CmdNewOrder, Order: limitOrder(3, types.Buy, 50000, 1)})
 	evts2 := pollEvents(e, 2, 2*time.Second)
 	var sawTrade bool
 	for _, ev := range evts2 {
-		if ev.Type == types.EvtTrade {
+		if types.EventType(ev.EvtType) == types.EvtTrade {
 			sawTrade = true
 		}
 	}
@@ -213,8 +216,8 @@ func TestPostOnlyRejectedOnCross(t *testing.T) {
 	if len(evts) == 0 {
 		t.Fatal("expected rejection event")
 	}
-	if evts[0].Type != types.EvtOrderRejected {
-		t.Errorf("want EvtOrderRejected, got %v", evts[0].Type)
+	if types.EventType(evts[0].EvtType) != types.EvtOrderRejected {
+		t.Errorf("want EvtOrderRejected, got %v", evts[0].EvtType)
 	}
 }
 
@@ -235,8 +238,8 @@ func TestCancelOrder(t *testing.T) {
 	if len(evts) == 0 {
 		t.Fatal("expected cancel confirmation")
 	}
-	if evts[0].Type != types.EvtOrderCancelled {
-		t.Errorf("want EvtOrderCancelled, got %v", evts[0].Type)
+	if types.EventType(evts[0].EvtType) != types.EvtOrderCancelled {
+		t.Errorf("want EvtOrderCancelled, got %v", evts[0].EvtType)
 	}
 }
 
@@ -258,9 +261,37 @@ func TestSequenceMonotone(t *testing.T) {
 		t.Fatalf("only received %d/%d events", len(evts), n)
 	}
 	for i := 1; i < len(evts); i++ {
-		if evts[i].SequenceNo <= evts[i-1].SequenceNo {
+		if evts[i].SeqNo <= evts[i-1].SeqNo {
 			t.Errorf("sequence not monotone at index %d: %d <= %d",
-				i, evts[i].SequenceNo, evts[i-1].SequenceNo)
+				i, evts[i].SeqNo, evts[i-1].SeqNo)
 		}
+	}
+}
+
+// ── Rejection reason is preserved ────────────────────────────────────────────
+
+func TestRejectionReasonPreserved(t *testing.T) {
+	e := newEngine()
+	defer e.Stop()
+
+	// Place a sell so that a PostOnly buy at the same price would cross.
+	submit(e, &types.Command{Type: types.CmdNewOrder, Order: limitOrder(1, types.Sell, 50000, 1)})
+	pollEvents(e, 1, 2*time.Second)
+
+	po := limitOrder(2, types.Buy, 50000, 1)
+	po.Type = types.PostOnly
+	submit(e, &types.Command{Type: types.CmdNewOrder, Order: po})
+
+	evts := pollEvents(e, 1, 2*time.Second)
+	if len(evts) == 0 {
+		t.Fatal("expected rejection event")
+	}
+	ev := evts[0]
+	if types.EventType(ev.EvtType) != types.EvtOrderRejected {
+		t.Fatalf("want EvtOrderRejected, got %v", ev.EvtType)
+	}
+	reason := string(bytes.TrimRight(ev.Reason[:], "\x00"))
+	if reason == "" {
+		t.Error("expected non-empty rejection reason")
 	}
 }

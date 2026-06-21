@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/xiaobaowan1988/oktrading/pkg/gateway"
+	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/shard"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
@@ -47,22 +49,21 @@ func main() {
 	go func() {
 		defer wg.Done()
 		deadline := time.Now().Add(5 * time.Second)
+		var evt offheap.RawEvent
 		for time.Now().Before(deadline) {
 			// BTC shard
 			for {
-				evt, ok := btcEng.TryPollEvent()
-				if !ok {
+				if !btcEng.TryPollEvent(&evt) {
 					break
 				}
-				printEvent(symBTC, evt)
+				printEvent(symBTC, &evt)
 			}
 			// ETH shard
 			for {
-				evt, ok := ethEng.TryPollEvent()
-				if !ok {
+				if !ethEng.TryPollEvent(&evt) {
 					break
 				}
-				printEvent(symETH, evt)
+				printEvent(symETH, &evt)
 			}
 			time.Sleep(1 * time.Millisecond)
 		}
@@ -214,44 +215,46 @@ func placePostOnly(gw *gateway.Gateway, sym string, uid uint64, side types.Side,
 
 // ── Event printer ─────────────────────────────────────────────────────────────
 
-func printEvent(sym string, evt *types.Event) {
-	switch evt.Type {
+func printEvent(sym string, evt *offheap.RawEvent) {
+	const sf = types.ScaleFactor
+	switch types.EventType(evt.EvtType) {
 	case types.EvtOrderAccepted:
-		o := evt.Order
 		fmt.Printf("[%s seq=%d] ORDER ACCEPTED  id=%-6d side=%-4s type=%-8s price=%.2f qty=%.8f\n",
-			sym, evt.SequenceNo, o.OrderID, o.Side,
-			orderTypeName(o.Type),
-			float64(o.Price)/scaleFactor,
-			float64(o.Quantity)/scaleFactor,
+			sym, evt.SeqNo, evt.OrderID, sideName(evt.Side),
+			orderTypeName(types.OrderType(evt.OrderType)),
+			float64(evt.Price)/float64(sf),
+			float64(evt.Quantity)/float64(sf),
 		)
-
 	case types.EvtTrade:
-		tr := evt.Trade
 		fmt.Printf("[%s seq=%d] TRADE          maker=%-6d taker=%-6d price=%.2f qty=%.8f\n",
-			sym, evt.SequenceNo, tr.MakerOrder.OrderID, tr.TakerOrder.OrderID,
-			float64(tr.Price)/scaleFactor,
-			float64(tr.Quantity)/scaleFactor,
+			sym, evt.SeqNo, evt.MakerOrderID, evt.OrderID,
+			float64(evt.Price)/float64(sf),
+			float64(evt.Quantity)/float64(sf),
 		)
-
 	case types.EvtOrderFilled:
-		o := evt.Order
-		fmt.Printf("[%s seq=%d] ORDER FILLED   id=%-6d status=%s filled=%.8f\n",
-			sym, evt.SequenceNo, o.OrderID, o.Status,
-			float64(o.FilledQty())/scaleFactor,
+		fmt.Printf("[%s seq=%d] ORDER FILLED   id=%-6d filled=%.8f\n",
+			sym, evt.SeqNo, evt.OrderID,
+			float64(evt.Quantity-evt.Remaining)/float64(sf),
 		)
-
 	case types.EvtOrderCancelled:
-		o := evt.Order
 		fmt.Printf("[%s seq=%d] ORDER CANCELLED id=%-6d remaining=%.8f\n",
-			sym, evt.SequenceNo, o.OrderID,
-			float64(o.Remaining)/scaleFactor,
+			sym, evt.SeqNo, evt.OrderID,
+			float64(evt.Remaining)/float64(sf),
 		)
-
 	case types.EvtOrderRejected:
-		fmt.Printf("[%s seq=%d] ORDER REJECTED  reason=%q\n",
-			sym, evt.SequenceNo, evt.Reason,
-		)
+		reason := string(bytes.TrimRight(evt.Reason[:], "\x00"))
+		fmt.Printf("[%s seq=%d] ORDER REJECTED  reason=%q\n", sym, evt.SeqNo, reason)
 	}
+}
+
+func sideName(s int8) string {
+	switch types.Side(s) {
+	case types.Buy:
+		return "BUY"
+	case types.Sell:
+		return "SELL"
+	}
+	return "UNKNOWN"
 }
 
 func orderTypeName(t types.OrderType) string {

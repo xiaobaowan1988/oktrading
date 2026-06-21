@@ -12,33 +12,34 @@
 //	                    │  receive
 //	                    ▼
 //	         ┌──────────────────────┐
-//	         │  Engine goroutine    │  ← runtime.LockOSThread()
+//	         │  Engine goroutine    │  ← runtime.LockOSThread() + optional sched_setaffinity
 //	         │  (state machine)     │
 //	         │  ┌────────────────┐  │
 //	         │  │  OrderBook     │  │
 //	         │  │  (in-memory)   │  │
 //	         │  └────────────────┘  │
 //	         └──────────┬───────────┘
-//	                    │  Push (single producer)
+//	                    │  PushOrder / PushTrade (single producer)
 //	                    ▼
 //	┌─────────────────────────────────────────────────┐
-//	│  outbound RingBuffer[Event]    (SPSC, lock-free) │
+//	│  outbound EventRing  (SPSC, C-malloc'd, off-heap)│
 //	└─────────────────────────────────────────────────┘
 //	     │  (TryPollEvent)
 //	     ▼
 //	Result handler / persistence / market-data fan-out
 //
-// # Inbound: channel vs ring buffer
+// # Off-heap outbound path
 //
-// The inbound path uses a buffered Go channel rather than the Disruptor ring
-// buffer.  The ring buffer is a pure SPSC structure; using it from multiple
-// producer goroutines causes a data race where two goroutines read the same
-// head value, write to the same slot, then both increment head — leaving a
-// slot that was never written and will produce a nil pointer on pop.
+// Events are written directly into C-malloc'd memory (pkg/offheap).  The Go
+// garbage collector never sees these allocations, so GC write-barriers on the
+// outbound hot path are eliminated entirely.  This removes the primary source
+// of GC-induced tail latency in the event pipeline.
 //
-// A Go channel is internally MPSC-safe and fast enough for the inbound path.
-// The single-producer outbound ring buffer (engine → result handler) remains
-// as-is and delivers the low-latency lock-free guarantee where it matters.
+// # CPU Affinity
+//
+// Call PinCPU(n) before Start() to have the engine goroutine call
+// sched_setaffinity(0, {n}) after locking its OS thread.  This eliminates OS
+// scheduler jitter and maximises L1/L2 cache locality for the order-book state.
 //
 // # Determinism
 //
@@ -49,10 +50,13 @@
 package engine
 
 import (
+	"fmt"
+	"os"
 	"runtime"
 	"time"
 
-	"github.com/xiaobaowan1988/oktrading/pkg/disruptor"
+	"github.com/xiaobaowan1988/oktrading/pkg/affinity"
+	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/orderbook"
 	"github.com/xiaobaowan1988/oktrading/pkg/pool"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
@@ -66,15 +70,16 @@ const (
 // Engine is a deterministic matching engine for exactly one symbol.
 // It must be started with Start() before commands are submitted.
 type Engine struct {
-	symbol   string
-	book     *orderbook.OrderBook
-	localSeq uint64 // intra-symbol sequence; monotone, no gaps
-	tradeSeq uint64 // trade ID counter
+	symbol      string
+	book        *orderbook.OrderBook
+	localSeq    uint64 // intra-symbol sequence; monotone, no gaps
+	tradeSeq    uint64 // trade ID counter
+	cpuAffinity int    // -1 means no pinning
 
 	// inbound is a buffered channel — safe for multiple concurrent producers.
 	inbound chan *types.Command
-	// outbound is a SPSC ring buffer — written only by the engine goroutine.
-	outbound *disruptor.RingBuffer[types.Event]
+	// outbound is a SPSC ring buffer backed by C-malloc'd memory.
+	outbound *offheap.EventRing
 
 	quit chan struct{}
 	done chan struct{}
@@ -91,17 +96,24 @@ func New(symbol string, inboundCap, outboundCap int) *Engine {
 		outboundCap = defaultOutboundSize
 	}
 	return &Engine{
-		symbol:   symbol,
-		book:     orderbook.New(symbol),
-		inbound:  make(chan *types.Command, inboundCap),
-		outbound: disruptor.New[types.Event](outboundCap),
-		quit:     make(chan struct{}),
-		done:     make(chan struct{}),
+		symbol:      symbol,
+		book:        orderbook.New(symbol),
+		inbound:     make(chan *types.Command, inboundCap),
+		outbound:    offheap.New(outboundCap),
+		cpuAffinity: -1,
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 
 // Symbol returns the trading pair this engine processes.
 func (e *Engine) Symbol() string { return e.symbol }
+
+// PinCPU configures the engine goroutine to be pinned to the given CPU core
+// via sched_setaffinity.  Must be called before Start().
+func (e *Engine) PinCPU(cpu int) {
+	e.cpuAffinity = cpu
+}
 
 // Start launches the engine's matching goroutine.
 func (e *Engine) Start() {
@@ -130,22 +142,29 @@ func (e *Engine) Submit(cmd *types.Command) {
 	e.inbound <- cmd
 }
 
-// TryPollEvent reads one result event from the outbound ring buffer.
-// Returns (nil, false) when empty.
-func (e *Engine) TryPollEvent() (*types.Event, bool) {
-	return e.outbound.TryPop()
+// TryPollEvent reads one result event from the outbound ring buffer into dst.
+// Returns false when the ring is empty.
+func (e *Engine) TryPollEvent(dst *offheap.RawEvent) bool {
+	return e.outbound.TryPop(dst)
 }
 
 // ── Matching loop ─────────────────────────────────────────────────────────────
 
 func (e *Engine) run() {
-	// Locking the goroutine to its OS thread approximates CPU pinning.
-	// For hard affinity combine with sched_setaffinity via cgo.
+	// Locking the goroutine to its OS thread is required before calling
+	// sched_setaffinity, which pins the *thread* not the goroutine.
 	runtime.LockOSThread()
 	defer func() {
 		runtime.UnlockOSThread()
 		close(e.done)
 	}()
+
+	if e.cpuAffinity >= 0 {
+		if err := affinity.Pin(e.cpuAffinity); err != nil {
+			// Graceful degradation: log the failure but continue running.
+			fmt.Fprintf(os.Stderr, "engine %s: cpu pin failed: %v\n", e.symbol, err)
+		}
+	}
 
 	for {
 		select {
@@ -187,31 +206,27 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		// Reject before touching the book if it would cross immediately.
 		if e.wouldCross(order) {
 			order.Status = types.StatusRejected
-			evt := pool.GetEvent()
-			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
-			evt.Reason = "post-only order would immediately match"
-			e.emit(evt)
+			e.outbound.PushOrderWithReason(types.EvtOrderRejected, e.localSeq, order, "post-only order would immediately match")
+			pool.PutOrder(order)
 			return
 		}
 		e.book.AddOrder(order)
-		evt := pool.GetEvent()
-		evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderAccepted, e.localSeq, e.symbol, order
-		e.emit(evt)
+		e.outbound.PushOrder(types.EvtOrderAccepted, e.localSeq, order)
+		// order now rests in the book — do NOT pool
 
 	case types.FOK:
 		// Pre-check: if full fill is impossible, reject without touching the book.
 		if !e.canFillCompletely(order) {
 			order.Status = types.StatusRejected
-			evt := pool.GetEvent()
-			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
-			evt.Reason = "insufficient liquidity for FOK"
-			e.emit(evt)
+			e.outbound.PushOrderWithReason(types.EvtOrderRejected, e.localSeq, order, "insufficient liquidity for FOK")
+			pool.PutOrder(order)
 			return
 		}
 		// Full fill is guaranteed – proceed.
 		trades := e.book.Match(order)
 		e.emitTrades(trades)
 		e.emitOrderUpdate(order)
+		pool.PutOrder(order)
 
 	case types.Limit:
 		trades := e.book.Match(order)
@@ -219,11 +234,11 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Rest the unfilled portion as a maker order.
 			e.book.AddOrder(order)
-			evt := pool.GetEvent()
-			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderAccepted, e.localSeq, e.symbol, order
-			e.emit(evt)
+			e.outbound.PushOrder(types.EvtOrderAccepted, e.localSeq, order)
+			// order rests in book — do NOT pool
 		} else {
 			e.emitOrderUpdate(order)
+			pool.PutOrder(order)
 		}
 
 	case types.IOC:
@@ -232,11 +247,11 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Cancel whatever could not be immediately filled.
 			order.Status = types.StatusCancelled
-			evt := pool.GetEvent()
-			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
-			e.emit(evt)
+			e.outbound.PushOrder(types.EvtOrderCancelled, e.localSeq, order)
+			pool.PutOrder(order)
 		} else {
 			e.emitOrderUpdate(order)
+			pool.PutOrder(order)
 		}
 
 	case types.Market:
@@ -245,34 +260,28 @@ func (e *Engine) handleNewOrder(cmd *types.Command) {
 		if order.Remaining > 0 {
 			// Market order exhausted all available liquidity; cancel residual.
 			order.Status = types.StatusCancelled
-			evt := pool.GetEvent()
-			evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
-			e.emit(evt)
+			e.outbound.PushOrder(types.EvtOrderCancelled, e.localSeq, order)
+			pool.PutOrder(order)
 		} else {
 			e.emitOrderUpdate(order)
+			pool.PutOrder(order)
 		}
 
 	default:
 		order.Status = types.StatusRejected
-		evt := pool.GetEvent()
-		evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderRejected, e.localSeq, e.symbol, order
-		evt.Reason = "unknown order type"
-		e.emit(evt)
+		e.outbound.PushOrderWithReason(types.EvtOrderRejected, e.localSeq, order, "unknown order type")
+		pool.PutOrder(order)
 	}
 }
 
 func (e *Engine) handleCancelOrder(cmd *types.Command) {
 	order, ok := e.book.CancelOrder(cmd.CancelID)
 	if !ok {
-		evt := pool.GetEvent()
-		evt.Type, evt.SequenceNo, evt.Symbol = types.EvtOrderRejected, e.localSeq, e.symbol
-		evt.Reason = "cancel rejected: order not found"
-		e.emit(evt)
+		e.outbound.PushOrderWithReason(types.EvtOrderRejected, e.localSeq, nil, "cancel rejected: order not found")
 		return
 	}
-	evt := pool.GetEvent()
-	evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderCancelled, e.localSeq, e.symbol, order
-	e.emit(evt)
+	e.outbound.PushOrder(types.EvtOrderCancelled, e.localSeq, order)
+	pool.PutOrder(order)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -327,21 +336,23 @@ func (e *Engine) emitTrades(trades []*types.Trade) {
 	for _, tr := range trades {
 		e.tradeSeq++
 		tr.TradeID = e.tradeSeq
-		tr.SequenceNo = e.localSeq
-		evt := pool.GetEvent()
-		evt.Type, evt.SequenceNo, evt.Symbol, evt.Trade = types.EvtTrade, e.localSeq, e.symbol, tr
-		e.emit(evt)
+
+		makerID := uint64(0)
+		makerStatus := types.OrderStatus(0)
+		if tr.MakerOrder != nil {
+			makerID = tr.MakerOrder.OrderID
+			makerStatus = tr.MakerOrder.Status
+		}
+		e.outbound.PushTrade(e.localSeq, tr.TradeID, tr.TakerOrder, makerID, makerStatus, tr.Price, tr.Quantity)
+
+		// Return fully-consumed maker to pool (engine now owns lifecycle).
+		if tr.MakerOrder != nil && tr.MakerOrder.Status == types.StatusFilled {
+			pool.PutOrder(tr.MakerOrder)
+		}
+		pool.PutTrade(tr)
 	}
 }
 
 func (e *Engine) emitOrderUpdate(order *types.Order) {
-	evt := pool.GetEvent()
-	evt.Type, evt.SequenceNo, evt.Symbol, evt.Order = types.EvtOrderFilled, e.localSeq, e.symbol, order
-	e.emit(evt)
-}
-
-func (e *Engine) emit(evt *types.Event) {
-	// Push blocks if the outbound buffer is full.  In production the downstream
-	// consumer (persistence pipeline) must drain fast enough to avoid this.
-	e.outbound.Push(evt)
+	e.outbound.PushOrder(types.EvtOrderFilled, e.localSeq, order)
 }

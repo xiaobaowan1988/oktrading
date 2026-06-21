@@ -4,14 +4,16 @@ import (
 	"testing"
 
 	"github.com/xiaobaowan1988/oktrading/pkg/engine"
+	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
 )
 
 // drainN consumes exactly n events from the engine's outbound buffer.
 // Called after the benchmark timer stops to flush the pipeline.
 func drainN(e *engine.Engine, n int) {
+	var dst offheap.RawEvent
 	for received := 0; received < n; {
-		if _, ok := e.TryPollEvent(); ok {
+		if e.TryPollEvent(&dst) {
 			received++
 		}
 	}

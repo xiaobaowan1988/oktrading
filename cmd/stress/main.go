@@ -12,6 +12,7 @@
 //	-takers     taker goroutines per symbol (default 4)
 //	-makers     maker goroutines per symbol (default 2)
 //	-report     print interval for live stats (default 3s)
+//	-pin        pin engine+consumer goroutines to dedicated CPU cores
 //
 // Workload: makers continuously replenish resting limit orders at N price
 // levels around a moving mid; takers sweep aggressively with market orders
@@ -32,7 +33,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/xiaobaowan1988/oktrading/pkg/affinity"
 	"github.com/xiaobaowan1988/oktrading/pkg/engine"
+	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/pool"
 	"github.com/xiaobaowan1988/oktrading/pkg/shard"
 	"github.com/xiaobaowan1988/oktrading/pkg/types"
@@ -49,6 +52,7 @@ var (
 	flagReport   = flag.Duration("report", 3*time.Second, "live stats interval (0 = off)")
 	flagGOGC     = flag.Int("gogc", 100, "GOGC percentage (-1=disable, 400=recommended with -memlimit)")
 	flagMemLimit = flag.Int64("memlimit", 0, "soft memory limit in MiB (0 = no limit; use -gogc=-1 with a limit)")
+	flagPin      = flag.Bool("pin", false, "pin engine+consumer goroutines to dedicated CPU cores")
 )
 
 // ── Global counters ───────────────────────────────────────────────────────────
@@ -79,6 +83,24 @@ func main() {
 	numTakers := *flagTakers
 	numMakers := *flagMakers
 
+	// Compute CPU assignments when -pin is requested.
+	// Engines get CPUs 1..numSymbols; consumers get CPUs numSymbols+1..2*numSymbols.
+	// Both ranges wrap modulo the number of available CPUs if needed.
+	numCPU := affinity.NumCPU()
+	engineCPUs := make([]int, numSymbols)
+	consumerCPUs := make([]int, numSymbols)
+	for i := 0; i < numSymbols; i++ {
+		engineCPUs[i] = (1 + i) % numCPU
+		consumerCPUs[i] = (1 + numSymbols + i) % numCPU
+	}
+	if !*flagPin {
+		// -1 signals "no pinning" to both engine and consumer.
+		for i := range engineCPUs {
+			engineCPUs[i] = -1
+			consumerCPUs[i] = -1
+		}
+	}
+
 	fmt.Printf("╔══════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║           OKX-Style Matching Engine  –  Stress Test        ║\n")
 	fmt.Printf("╠══════════════════════════════════════════════════════╣\n")
@@ -89,6 +111,7 @@ func main() {
 	fmt.Printf("║  Makers/sym : %-40d║\n", numMakers)
 	fmt.Printf("║  Takers/sym : %-40d║\n", numTakers)
 	fmt.Printf("║  Duration   : %-40s║\n", *flagDuration)
+	fmt.Printf("║  CPU pin    : %-40v║\n", *flagPin)
 	fmt.Printf("╚══════════════════════════════════════════════════════╝\n\n")
 
 	mgr := shard.NewManager(1<<17, 1<<18)
@@ -98,7 +121,17 @@ func main() {
 	engines := make([]*engine.Engine, numSymbols)
 	for i := range symbols {
 		symbols[i] = fmt.Sprintf("SYM%04d-USDT", i)
-		engines[i] = mgr.GetOrCreate(symbols[i])
+		if engineCPUs[i] >= 0 {
+			// When CPU pinning is requested, create the engine directly so
+			// PinCPU can be called before Start.  We bypass the shard manager
+			// for these engines; the manager is still used for non-pinned paths.
+			eng := engine.New(symbols[i], 1<<17, 1<<18)
+			eng.PinCPU(engineCPUs[i])
+			eng.Start()
+			engines[i] = eng
+		} else {
+			engines[i] = mgr.GetOrCreate(symbols[i])
+		}
 	}
 
 	// Per-symbol latency histograms (one per consumer goroutine, merged at end).
@@ -127,12 +160,13 @@ func main() {
 		eng := engines[i]
 		sym := symbols[i]
 		hist := histograms[i]
+		conscpu := consumerCPUs[i]
 
 		// Consumer: drains the outbound ring buffer and records latencies.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runConsumer(eng, hist, deadline)
+			runConsumer(eng, hist, conscpu, deadline)
 		}()
 
 		// Makers: continuously replenish the book.
@@ -214,8 +248,9 @@ func warmup(engines []*engine.Engine, symbols []string, depth int) {
 				})
 			}
 			// Drain all accepted events.
+			var dst offheap.RawEvent
 			for received := 0; received < depth*2; {
-				if _, ok := eng.TryPollEvent(); ok {
+				if eng.TryPollEvent(&dst) {
 					received++
 				} else {
 					runtime.Gosched()
@@ -338,63 +373,58 @@ func runTaker(eng *engine.Engine, sym string, depth, takerID int, deadline time.
 // ── Consumer goroutine ────────────────────────────────────────────────────────
 
 // runConsumer drains the outbound ring buffer and records latencies.
-// Latency = (event receipt time) – (Order.Timestamp set by engine at dequeue).
+// Latency = (event receipt time) – (Timestamp stored in the off-heap slot).
 // This measures pure engine processing time: channel dequeue → matching → outbound write → consumer read.
-func runConsumer(eng *engine.Engine, hist *LatencyHistogram, deadline time.Time) {
-	// Run slightly past deadline to drain the pipeline.
+//
+// consumerCPU >= 0 causes the goroutine to lock its OS thread and call
+// sched_setaffinity to pin itself to that core.
+func runConsumer(eng *engine.Engine, hist *LatencyHistogram, consumerCPU int, deadline time.Time) {
+	if consumerCPU >= 0 {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := affinity.Pin(consumerCPU); err != nil {
+			fmt.Fprintf(os.Stderr, "consumer pin failed: %v\n", err)
+		}
+	}
+
+	var evt offheap.RawEvent
 	extended := deadline.Add(500 * time.Millisecond)
+	pinned := consumerCPU >= 0
 
 	for time.Now().Before(extended) {
-		evt, ok := eng.TryPollEvent()
-		if !ok {
+		if !eng.TryPollEvent(&evt) {
 			if time.Now().After(deadline) {
-				break // book is draining; give it a moment
+				break
 			}
-			runtime.Gosched()
+			// Pinned consumers have a dedicated core: pure busy-spin.
+			// Unpinned consumers yield cooperatively to avoid starving producers.
+			if !pinned {
+				runtime.Gosched()
+			}
 			continue
 		}
 
 		now := time.Now().UnixNano()
 		atomic.AddInt64(&totalEvents, 1)
 
-		switch evt.Type {
+		switch types.EventType(evt.EvtType) {
 		case types.EvtTrade:
 			atomic.AddInt64(&totalTrades, 1)
-			if evt.Trade != nil {
-				if evt.Trade.TakerOrder != nil && evt.Trade.TakerOrder.Timestamp > 0 {
-					hist.Record(now - evt.Trade.TakerOrder.Timestamp)
-				}
-				// Return fully-consumed maker order to pool.
-				if evt.Trade.MakerOrder != nil && evt.Trade.MakerOrder.Status == types.StatusFilled {
-					pool.PutOrder(evt.Trade.MakerOrder)
-				}
-				pool.PutTrade(evt.Trade)
+			if evt.Timestamp > 0 {
+				hist.Record(now - evt.Timestamp)
 			}
 		case types.EvtOrderFilled:
-			// Taker order fully filled; all EvtTrade events for this order have
-			// already been processed (ring buffer is FIFO) so the Order is safe to return.
 			atomic.AddInt64(&totalFills, 1)
-			if evt.Order != nil {
-				pool.PutOrder(evt.Order)
-			}
 		case types.EvtOrderCancelled:
 			atomic.AddInt64(&totalCancels, 1)
-			if evt.Order != nil {
-				pool.PutOrder(evt.Order)
-			}
 		case types.EvtOrderRejected:
 			atomic.AddInt64(&totalRejects, 1)
-			if evt.Order != nil {
-				pool.PutOrder(evt.Order)
-			}
 		case types.EvtOrderAccepted:
-			// Resting maker order — DO NOT return Order (still lives in the book).
-			if evt.Order != nil && evt.Order.Timestamp > 0 {
-				hist.Record(now - evt.Order.Timestamp)
+			if evt.Timestamp > 0 {
+				hist.Record(now - evt.Timestamp)
 			}
 		}
-		// Event wrapper itself is always safe to return after the switch above.
-		pool.PutEvent(evt)
+		// No pool returns needed: engine handles all lifecycle pooling.
 	}
 }
 
