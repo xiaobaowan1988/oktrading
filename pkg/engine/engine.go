@@ -6,8 +6,9 @@
 //	     │  (TrySubmit / Submit)
 //	     ▼
 //	┌─────────────────────────────────────────────────┐
-//	│  inbound  chan *Command  (buffered Go channel)   │
-//	│           MPSC-safe: multiple producers allowed  │
+//	│  inbound  *mpsc.Ring  (lock-free CAS ring)       │
+//	│           Producers claim slots via CAS; writes  │
+//	│           to different slots happen in parallel. │
 //	└───────────────────┬─────────────────────────────┘
 //	                    │  receive
 //	                    ▼
@@ -56,6 +57,7 @@ import (
 	"time"
 
 	"github.com/xiaobaowan1988/oktrading/pkg/affinity"
+	"github.com/xiaobaowan1988/oktrading/pkg/mpsc"
 	"github.com/xiaobaowan1988/oktrading/pkg/offheap"
 	"github.com/xiaobaowan1988/oktrading/pkg/orderbook"
 	"github.com/xiaobaowan1988/oktrading/pkg/pool"
@@ -76,8 +78,8 @@ type Engine struct {
 	tradeSeq    uint64 // trade ID counter
 	cpuAffinity int    // -1 means no pinning
 
-	// inbound is a buffered channel — safe for multiple concurrent producers.
-	inbound chan *types.Command
+	// inbound is a lock-free MPSC ring — producers claim slots via CAS.
+	inbound *mpsc.Ring
 	// outbound is a SPSC ring buffer backed by C-malloc'd memory.
 	outbound *offheap.EventRing
 
@@ -98,7 +100,7 @@ func New(symbol string, inboundCap, outboundCap int) *Engine {
 	return &Engine{
 		symbol:      symbol,
 		book:        orderbook.New(symbol),
-		inbound:     make(chan *types.Command, inboundCap),
+		inbound:     mpsc.New(inboundCap),
 		outbound:    offheap.New(outboundCap),
 		cpuAffinity: -1,
 		quit:        make(chan struct{}),
@@ -127,19 +129,14 @@ func (e *Engine) Stop() {
 }
 
 // TrySubmit dispatches a command without blocking.
-// Returns false if the inbound channel is at capacity (back-pressure signal).
+// Returns false if the inbound ring is at capacity (back-pressure signal).
 func (e *Engine) TrySubmit(cmd *types.Command) bool {
-	select {
-	case e.inbound <- cmd:
-		return true
-	default:
-		return false
-	}
+	return e.inbound.TrySubmit(cmd)
 }
 
-// Submit dispatches a command, blocking until the inbound channel has space.
+// Submit dispatches a command, spinning until the inbound ring has space.
 func (e *Engine) Submit(cmd *types.Command) {
-	e.inbound <- cmd
+	e.inbound.Submit(cmd)
 }
 
 // TryPollEvent reads one result event from the outbound ring buffer into dst.
@@ -166,12 +163,27 @@ func (e *Engine) run() {
 		}
 	}
 
+	pinned := e.cpuAffinity >= 0
+	idle := 0
 	for {
-		select {
-		case cmd := <-e.inbound:
+		cmd := e.inbound.TryPop()
+		if cmd != nil {
+			idle = 0
 			e.process(cmd)
-		case <-e.quit:
-			return
+			continue
+		}
+		idle++
+		// Check quit signal every 16k idle iterations (~16 µs at 1 GHz spin).
+		if idle&0x3FFF == 0 {
+			select {
+			case <-e.quit:
+				return
+			default:
+			}
+		}
+		// Yield cooperatively when not pinned to avoid burning an unshared core.
+		if !pinned {
+			runtime.Gosched()
 		}
 	}
 }
